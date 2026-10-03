@@ -3,22 +3,20 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { listen } from '@tauri-apps/api/event';
 import { decodeSubscription, parseLinks, type VNode } from './parser';
-import { buildConfig, type BuildOpts } from './singbox';
+import { buildConfig, buildAetherConfig } from './singbox';
 import { BUILTIN_SOURCES, DEFAULT_TOP_N, PROXY_PORT, RELEASE_API, RELEASE_PAGE, type SubSource } from './config';
 import { smartScan, realTest, type ScanState } from './scan';
 import { t, type Lang } from './i18n';
 import { I } from './icons';
 import { GEO, ccHue } from './geo';
 import Globe from './components/Globe';
-import Warp from './components/Warp';
-import Orb from './components/Orb';
-import Name3D from './components/Name3D';
-import Floaters from './components/Floaters';
-import Ico3, { type IcoName } from './components/Ico3';
+import CoreIcon from './components/CoreIcon';
+import WaveName from './components/WaveName';
 import { Area, Count } from './components/bits';
 
 type Status = 'idle' | 'connecting' | 'connected';
 type Mode = 'tun' | 'proxy';
+type ConnectionModel = 'configs' | 'aether';
 type Page = 'home' | 'servers' | 'stats' | 'settings';
 type Step = '' | 'test' | 'start' | 'switch';
 type Theme = 'violet' | 'cyan' | 'emerald' | 'sunset';
@@ -28,7 +26,7 @@ type CustomSub = { id: string; name: string; url: string };
 type LastScan = { pool: number; alive: number; tested: number; ok: number; picked: number; ms: number; at: number } | null;
 type Src = 'own' | 'pub';
 
-const VERSION = '3.0.0';
+const VERSION = '2.5.0';
 /** مقایسه‌ی نسخه: a > b ؟ */
 const newer = (a: string, b: string) => { const x = a.replace(/^v/, '').split('.').map(Number), y = b.split('.').map(Number); for (let i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); } return false; };
 const HIST = 90;
@@ -123,7 +121,11 @@ function ScanPanel({ s, T, compact }: { s: ScanState; T: (typeof t)['fa']; compa
 
 export default function App() {
   const [lang, setLang] = useState<Lang>(() => load('lang', 'fa'));
-  const [mode, setMode] = useState<Mode>(() => load('mode', 'tun'));
+  const [mode, setMode] = useState<Mode>(() => load<string>('mode', 'proxy') === 'tun' ? 'tun' : 'proxy');
+  const [model, setModel] = useState<ConnectionModel>(() => load<string>('model', 'configs') === 'aether' ? 'aether' : 'configs');
+  const [modelPicker, setModelPicker] = useState(false);
+  const [aetherStage, setAetherStage] = useState('');
+  const connectionLock = useRef(false);
   const [auto, setAuto] = useState<boolean>(() => load('auto', true));
   const [sortPing, setSortPing] = useState<boolean>(() => load('sortPing', false));
   const [links, setLinks] = useState<string[]>(() => load('links', []));
@@ -134,8 +136,6 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(() => load('theme', 'violet'));
   const [reduce, setReduce] = useState<boolean>(() => load('reduce', false));
   const [autoConnect, setAutoConnect] = useState<boolean>(() => load('autoConnect', false));
-  // v2.5: split tunnel ایران
-  const [bypassIr, setBypassIr] = useState<boolean>(() => load('bypassIr', true));
   const [topN, setTopN] = useState<number>(() => load('topN', DEFAULT_TOP_N));
   const [customSubs, setCustomSubs] = useState<CustomSub[]>(() => load('customSubs', []));
   const [subOff, setSubOff] = useState<string[]>(() => load('subOff', []));
@@ -218,6 +218,11 @@ export default function App() {
 
   useEffect(() => save('lang', lang), [lang]);
   useEffect(() => save('mode', mode), [mode]);
+  useEffect(() => save('model', model), [model]);
+  useEffect(() => {
+    const pending = listen<string>('aether-progress', ({ payload }) => setAetherStage(payload));
+    return () => { pending.then((unlisten) => unlisten()).catch(() => {}); };
+  }, []);
   useEffect(() => save('auto', auto), [auto]);
   useEffect(() => save('sortPing', sortPing), [sortPing]);
   useEffect(() => save('links', links), [links]);
@@ -228,7 +233,6 @@ export default function App() {
   useEffect(() => save('theme', theme), [theme]);
   useEffect(() => save('reduce', reduce), [reduce]);
   useEffect(() => save('autoConnect', autoConnect), [autoConnect]);
-  useEffect(() => save('bypassIr', bypassIr), [bypassIr]);
   useEffect(() => save('topN', topN), [topN]);
   useEffect(() => save('customSubs', customSubs), [customSubs]);
   useEffect(() => save('subOff', subOff), [subOff]);
@@ -283,26 +287,12 @@ export default function App() {
       el.appendChild(s);
       window.setTimeout(() => s.remove(), 700);
     };
-    let tilted: HTMLElement | null = null;
     const onMove = (e: PointerEvent) => {
-      // پارالاکس اشیای شناور
-      const root = document.documentElement;
-      root.style.setProperty('--px', ((e.clientX / window.innerWidth) - 0.5).toFixed(3));
-      root.style.setProperty('--py', ((e.clientY / window.innerHeight) - 0.5).toFixed(3));
-      const el = (e.target as HTMLElement).closest?.<HTMLElement>('.glass, .srv, .tilt');
-      // کج شدن سه‌بعدی کارت‌ها زیر موس
-      const tl = (e.target as HTMLElement).closest?.<HTMLElement>('.tilt');
-      if (tilted && tilted !== tl) { tilted.style.removeProperty('--rx'); tilted.style.removeProperty('--ry'); }
-      tilted = tl ?? null;
+      const el = (e.target as HTMLElement).closest?.<HTMLElement>('.glass, .srv');
       if (!el) return;
       const r = el.getBoundingClientRect();
       el.style.setProperty('--mx', `${e.clientX - r.left}px`);
       el.style.setProperty('--my', `${e.clientY - r.top}px`);
-      if (tl) {
-        const q = tl.getBoundingClientRect();
-        tl.style.setProperty('--rx', `${(((e.clientY - q.top) / q.height) - 0.5) * -10}deg`);
-        tl.style.setProperty('--ry', `${(((e.clientX - q.left) / q.width) - 0.5) * 12}deg`);
-      }
     };
     document.addEventListener('pointerdown', onDown);
     document.addEventListener('pointermove', onMove);
@@ -329,7 +319,7 @@ export default function App() {
     showToast(msg, 'err');
   };
 
-  useEffect(() => { if (!links.length) updateConfigs(); }, []); // eslint-disable-line
+  // Fetch on Connect in model 1, not on startup: model 2 needs no subscriptions.
 
   // مانیتور اتصال، تایمر و سرعت
   useEffect(() => {
@@ -394,7 +384,7 @@ export default function App() {
    * reuse=true: ساب رو دوباره دانلود نمی‌کنه، فقط با همون استخر قبلی دوباره سریع‌ترین‌ها رو پیدا می‌کنه
    */
   async function updateConfigs(reuse = false) {
-    if (busy || status === 'connecting') return;
+    if (busy || status === 'connecting' || (model === 'aether' && status !== 'idle')) return;
     setBusy('fetch');
     setScan({ phase: 'fetch', pool: 0, tcpDone: 0, tcpTotal: 0, alive: 0, tested: 0, ok: 0, target: topN });
     testingRef.current = true;
@@ -447,6 +437,7 @@ export default function App() {
       if (!all.some((n) => n.id === selected)) setSelected(all[0].id);
       showToast(pub.length ? T.scanDone(top.length, poolSize, own.length) : T.updated(all.length, skipped), 'ok');
       if (failed.length) showToast(T.srcFailed(failed.join('، ')), 'err');
+      return { nodes: all, pings: p };
     } catch (e) {
       fail(`${T.fetchErr}: ${errMsg(e)}`);
     } finally {
@@ -467,26 +458,12 @@ export default function App() {
     return res;
   }
 
-  async function startNode(n: VNode, bypass = bypassIr) {
-    const run = (o: BuildOpts) => invoke('start_core', {
-      config: JSON.stringify(buildConfig(n, mode, PROXY_PORT, o)),
+  async function startNode(n: VNode) {
+    await invoke('start_core', {
+      config: JSON.stringify(buildConfig(n, mode, PROXY_PORT)),
       systemProxy: mode === 'proxy',
       port: PROXY_PORT,
     });
-    if (!bypass) await run({ bypassIran: false });
-    else {
-      // اول لیست کامل ایران (گیت‌هاب، بعد jsDelivr)؛ اگه دانلود نشد، با لیست داخلی وصل میشه که اتصال خراب نشه
-      try { await run({ bypassIran: true }); }
-      catch (e1) {
-        if (!/rule-set|rule_set|ruleset|srs/i.test(errMsg(e1))) throw e1;
-        try { await run({ bypassIran: true, cdn: true }); }
-        catch (e2) {
-          if (!/rule-set|rule_set|ruleset|srs/i.test(errMsg(e2))) throw e2;
-          await run({ bypassIran: true, remoteRules: false });
-          showToast(T.irLite, 'err');
-        }
-      }
-    }
     lastStats.current = null;
     setSpeed({ up: 0, down: 0, total: 0 });
     setHist([]);
@@ -499,18 +476,8 @@ export default function App() {
     checkIp();
   }
 
-  /** تغییر split tunnel وسط اتصال: تونل با تنظیم جدید دوباره ساخته میشه */
-  async function changeBypass(v: boolean) {
-    setBypassIr(v);
-    if (status !== 'connected' || !active) return;
-    testingRef.current = true;
-    try { await startNode(active, v); showToast(v ? T.irOn : T.irOff, 'ok'); }
-    catch (e) { setStatus('idle'); setActiveId(null); fail(`${T.connErr}: ${errMsg(e)}`); }
-    finally { testingRef.current = false; }
-  }
-
   async function testAll() {
-    if (busy || status === 'connecting' || !nodes.length) return;
+    if (busy || status === 'connecting' || !nodes.length || (model === 'aether' && status !== 'idle')) return;
     setBusy('test');
     testingRef.current = true;
     const reconnect = status === 'connected' && mode === 'tun' ? active : undefined;
@@ -524,34 +491,53 @@ export default function App() {
   }
 
   async function disconnect() {
-    await invoke('stop_core').catch(() => {});
+    try { await invoke('stop_core'); }
+    catch (e) { fail(errMsg(e)); return; }
     setStatus('idle');
     setActiveId(null);
     setIp(null);
+    setAetherStage('');
   }
 
   async function toggle() {
-    if (status === 'connecting' || busy) return;
-    if (status === 'connected') return disconnect();
-    if (!nodes.length) return fail(T.noConfigs);
-    if (mode === 'tun' && !(await invoke<boolean>('is_admin').catch(() => false))) { surface(); return setAdminAsk(true); }
-
-    setStatus('connecting');
+    if (connectionLock.current || status === 'connecting' || busy) return;
+    connectionLock.current = true;
     try {
+      if (status === 'connected') return await disconnect();
+      if (mode === 'tun' && !(await invoke<boolean>('is_admin').catch(() => false))) { surface(); return setAdminAsk(true); }
+      if (model === 'aether') {
+        setStatus('connecting'); setStep('start'); setAetherStage('discovering');
+        await invoke('start_aether', {
+          config: JSON.stringify(buildAetherConfig(mode, PROXY_PORT, 1819)),
+          systemProxy: mode === 'proxy',
+          port: PROXY_PORT,
+        });
+        lastStats.current = null;
+        setSpeed({ up: 0, down: 0, total: 0 }); setHist([]);
+        setActiveId(null); setSince(Date.now()); setNow(Date.now());
+        setStatus('connected'); setStep(''); setFlash((f) => f + 1);
+        checkIp();
+        return;
+      }
+      let available = nodes, measured = pings;
+      // Return the fresh data directly: React state has not committed yet.
+      if (!nodes.length || (auto && Date.now() - fetchedAt > 3600000)) {
+        const fresh = await updateConfigs();
+        if (!fresh) return;
+        available = fresh.nodes; measured = fresh.pings;
+      }
+      setStatus('connecting');
       let order: VNode[];
       if (auto) {
-        let p = pings;
-        if (!nodes.some((n) => (p[n.id] ?? -1) > 0)) {
-          setStep('test');
-          testingRef.current = true;
-          p = await runTest(nodes);
-          setPings(p);
-          testingRef.current = false;
-        }
-        order = nodes.filter((n) => (p[n.id] ?? -1) > 0).sort((a, b) => p[a.id] - p[b.id]).slice(0, 3);
+        setStep('test');
+        testingRef.current = true;
+        const p = await runTest(available);
+        measured = p; setPings(p);
+        testingRef.current = false;
+        order = available.filter((n) => (measured[n.id] ?? -1) > 0).sort((a, b) => measured[a.id] - measured[b.id]);
         if (!order.length) throw new Error(T.noWorking);
       } else {
-        order = [nodes.find((n) => n.id === selected) || nodes[0]];
+        order = [available.find((n) => n.id === selected) || available[0]];
       }
       setStep('start');
       let last: unknown;
@@ -563,11 +549,18 @@ export default function App() {
       testingRef.current = false;
       setStatus('idle');
       setStep('');
+      setActiveId(null);
+      setIp(null);
       fail(`${T.connErr}: ${errMsg(e)}`);
+    } finally {
+      connectionLock.current = false;
     }
   }
 
   async function pick(n: VNode) {
+    if (busy || status === 'connecting' || connectionLock.current) return;
+    if (model === 'aether' && status !== 'idle') return fail(lang === 'fa' ? 'برای تغییر مدل ابتدا اتصال را قطع کنید.' : 'Disconnect before changing the model.');
+    setModel('configs');
     setSelected(n.id);
     setAuto(false);
     if (status === 'connected' && n.id !== activeId) {
@@ -579,7 +572,9 @@ export default function App() {
 
   /** مستقیم وصل شو به یه سرور مشخص (از لیست یا پالت) */
   async function connectTo(n: VNode) {
-    if (status === 'connecting' || busy) return;
+    if (status === 'connecting' || busy || connectionLock.current) return;
+    if (model === 'aether' && status !== 'idle') return fail(lang === 'fa' ? 'برای تغییر مدل ابتدا اتصال را قطع کنید.' : 'Disconnect before changing the model.');
+    setModel('configs');
     if (status === 'connected') return pick(n);
     setSelected(n.id); setAuto(false);
     if (mode === 'tun' && !(await invoke<boolean>('is_admin').catch(() => false))) return setAdminAsk(true);
@@ -588,7 +583,8 @@ export default function App() {
   }
 
   async function connectFastest() {
-    if (status === 'connecting' || busy || !nodes.length) return;
+    if (status === 'connecting' || busy || connectionLock.current || !nodes.length) return;
+    if (model === 'aether' && status !== 'idle') return fail(lang === 'fa' ? 'برای تغییر مدل ابتدا اتصال را قطع کنید.' : 'Disconnect before changing the model.');
     let p = pings;
     if (!nodes.some((n) => (p[n.id] ?? -1) > 0)) {
       setBusy('test'); testingRef.current = true;
@@ -662,10 +658,8 @@ export default function App() {
     const r = magRef.current.getBoundingClientRect();
     const dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
     magRef.current.style.transform = `translate(${dx * 0.12}px, ${dy * 0.12}px)`;
-    magRef.current.style.setProperty('--ox', (dx / r.width).toFixed(3));
-    magRef.current.style.setProperty('--oy', (dy / r.height).toFixed(3));
   };
-  const offMag = () => { if (magRef.current) { magRef.current.style.transform = ''; magRef.current.style.removeProperty('--ox'); magRef.current.style.removeProperty('--oy'); } };
+  const offMag = () => { if (magRef.current) magRef.current.style.transform = ''; };
 
   actions.current = { toggle, updateConfigs: refetch, rescan, testAll };
 
@@ -680,12 +674,14 @@ export default function App() {
 
   // اتصال خودکار موقع باز شدن برنامه (یه بار، وقتی سرورها آماده‌ان)
   const autoDone = useRef(false);
+  const resumeConnect = useRef(load<boolean>('resumeConnect', false));
   useEffect(() => {
-    if (autoDone.current || !autoConnect || splash || !nodes.length || status !== 'idle' || busy) return;
+    if (autoDone.current || (!autoConnect && !resumeConnect.current) || splash || status !== 'idle' || busy) return;
     autoDone.current = true;
+    resumeConnect.current = false; save('resumeConnect', false);
     fromTray.current = true; // اگه پنجره مخفیه و خطا داد، بیارش جلو
     actions.current.toggle().finally(() => { fromTray.current = false; });
-  }, [autoConnect, splash, nodes.length, status, busy]);
+  }, [autoConnect, splash, model, status, busy]);
 
   // اعلان ویندوز وقتی پنجره مخفیه (Rust خودش چک می‌کنه)
   const prevStatus = useRef<Status>('idle');
@@ -748,137 +744,228 @@ export default function App() {
   }, [palQ, status, mode, lang, nodes, pings, T, auto, busy, selected, activeId]); // eslint-disable-line
   const runPal = (it?: PItem) => { if (!it) return; setPal(false); window.setTimeout(it.run, 60); };
 
-  /* ================= PAGES (v3.0 · WARP) ================= */
-  const busyOff = !!busy || status === 'connecting';
-  const Dashboard = (
+  /* ================= PAGES ================= */
+  const AdvancedDashboard = (
     <div className="pg dash">
-      <section className="stage">
-        <Floaters show={!reduce} />
-        <div className="stage-top">
-          <Name3D status={status} />
-          <div className="stage-chips">
-            <span className={`chip st ${status}`}><i />{label}</span>
-            <span className="chip">{mode === 'tun' ? I.cpu : I.proxy}{mode.toUpperCase()}</span>
-            {bypassIr && <span className="chip ir" title={T.bypassIrHint}>IR ⇢ direct</span>}
-          </div>
-        </div>
-        <div className="core-area">
-          <div className="mag" ref={magRef} onMouseMove={onMag} onMouseLeave={offMag}>
-            <Orb status={status} onClick={toggle} disabled={!!busy && status !== 'connected'} label={status === 'connected' ? T.disconnect : T.connect}
-              sub={status === 'connected' ? T.disconnect : status === 'connecting' ? '···' : T.connect} flash={flash} shake={shake} />
-          </div>
-          <div className="core-label">
-            <b key={label + stepText}>{status === 'connecting' && stepText ? stepText : label}</b>
-            {status === 'connected'
-              ? <span className="timer mono">{fmtTime(now - since).split('').map((c, i) => <span key={i} className={c === ':' ? 'sep' : 'dg'}>{c}</span>)}</span>
-              : <small>{status === 'connecting' ? T.wait : T.tapConnect}</small>}
-            {status === 'connecting' && <div className="steps">{(['test', 'start'] as Step[]).map((s, i) => <i key={s} className={step === s || (step === 'start' && i === 0) || step === 'switch' ? 'on' : ''} />)}</div>}
-          </div>
-        </div>
-        {status === 'connected' && (
-          <div className="ribbon">
-            <div className="rb-i dl"><Ico3 name="down" size="s" live /><span><small>{T.down}</small><b className="mono"><Count value={speed.down} fmt={fmtBytes} /><em>/s</em></b></span></div>
-            <div className="rb-i ul"><Ico3 name="up" size="s" live /><span><small>{T.up}</small><b className="mono"><Count value={speed.up} fmt={fmtBytes} /><em>/s</em></b></span></div>
-            <button className="rb-i ipb h3" onClick={copyIp} disabled={!ip || typeof ip !== 'object'} title={T.ip}>
-              <Ico3 name="globe" size="s" />
-              <span><small>{T.ip}</small><b className="mono">{ip === 'loading' ? <span className="skel" /> : ip && typeof ip === 'object' ? <><Flag cc={ip.countryCode} size="s" />{ip.query}</> : '—'}</b></span>
+      <div className="side">
+        {/* v2.4 · کارهای سریع: دریافت کانفیگ همیشه دم دسته */}
+        <Card className="dock">
+          {hasUpd && (
+            <button className="upd-pill rp" onClick={openRelease}>{I.rocket}<span>{T.newVer(upd)}</span><b>{T.download}</b></button>
+          )}
+          <button className={`get-cfg rp ${busy === 'fetch' || busy === 'scan' ? 'busy' : ''}`} onClick={refetch} disabled={!!busy || status === 'connecting'}>
+            <span className="gc-ic"><span className={busy === 'fetch' || busy === 'scan' ? 'spin' : ''}>{I.refresh}</span></span>
+            <span className="gc-tx">
+              <b>{busy === 'fetch' ? T.fetching : busy === 'scan' ? T.scanning : T.getConfigs}</b>
+              <small title={freshText}><i className={`fr ${fresh}`} />{mins < 0 ? T.getConfigsSub : updatedText}{nodes.length ? ` · ${nodes.length} ${T.configs}` : ''}</small>
+            </span>
+            <kbd className="gc-k">F5</kbd>
+          </button>
+          <div className="acts">
+            <button className="act rp" onClick={rescan} disabled={!!busy || status === 'connecting'} title="Ctrl+R">
+              <span className={busy === 'scan' ? 'spin' : ''}>{I.radar}</span><span>{T.rescan}</span>
+            </button>
+            <button className="act rp" onClick={testAll} disabled={!!busy || status === 'connecting' || !nodes.length} title="Ctrl+T">
+              <span className={busy === 'test' ? 'pulse' : ''}>{I.pulse}</span><span>{busy === 'test' ? T.testing : T.testPing}</span>
+            </button>
+            <button className="act rp" onClick={() => setImportOpen(true)} title="Ctrl+I">
+              {I.paste}<span>{T.importCfg}</span>
             </button>
           </div>
-        )}
-      </section>
-
-      <aside className="side">
-        {hasUpd && <button className="upd-pill rp h3" onClick={openRelease}><Ico3 name="rocket" size="s" /><span>{T.newVer(upd)}</span><b>{T.download}</b></button>}
-        <button className={`get-cfg rp h3 tilt ${busy === 'fetch' || busy === 'scan' ? 'busy' : ''}`} onClick={refetch} disabled={busyOff}>
-          <Ico3 name="refresh" size="l" live={busy === 'fetch' || busy === 'scan'} />
-          <span className="gc-tx">
-            <b>{busy === 'fetch' ? T.fetching : busy === 'scan' ? T.scanning : T.getConfigs}</b>
-            <small title={freshText}><i className={`fr ${fresh}`} />{mins < 0 ? T.getConfigsSub : updatedText}{nodes.length ? ` · ${nodes.length} ${T.configs}` : ''}</small>
-          </span>
-          <kbd>F5</kbd>
-        </button>
-        <div className="acts">
-          <button className="act rp h3 tilt" onClick={rescan} disabled={busyOff} title="Ctrl+R"><Ico3 name="radar" live={busy === 'scan'} /><span>{T.rescan}</span></button>
-          <button className="act rp h3 tilt" onClick={testAll} disabled={busyOff || !nodes.length} title="Ctrl+T"><Ico3 name="pulse" live={busy === 'test'} /><span>{busy === 'test' ? T.testing : T.testPing}</span></button>
-          <button className="act rp h3 tilt" onClick={() => setImportOpen(true)} title="Ctrl+I"><Ico3 name="paste" /><span>{T.importCfg}</span></button>
-        </div>
+        </Card>
 
         {scan ? (
-          <Card className="dest scan-card"><ScanPanel s={scan} T={T} compact /></Card>
+        <Card className="srv-card scan-card"><ScanPanel s={scan} T={T} compact /></Card>
         ) : !nodes.length ? (
-          <Card className="dest empty-home"><Ico3 name="servers" size="xl" live /><b>{T.noConfigs}</b><small>{T.emptyHint}</small></Card>
+        <Card className="srv-card empty-home">
+          <div className="eh-ic">{I.servers}</div>
+          <b>{T.noConfigs}</b>
+          <small>{T.emptyHint}</small>
+        </Card>
         ) : (
-          <Card className="dest">
-            <div className="dest-globe"><Globe status={status} markers={markers} target={status !== 'idle' ? (active ? splitFlag(active.name).cc : undefined) : undefined} a1={a1} a2={a2} st={ST[status]} reduce={reduce} /></div>
-            <div className="dest-body">
-              <div className="lbl">{status === 'connected' ? T.current : T.location}</div>
-              <div className="srv-row">
-                <Flag cc={shownFlag?.cc || (auto ? 'AI' : '')} size="l" />
-                <div className="srv-txt">
-                  <b dir="auto">{shownNode ? shownFlag?.label : auto ? T.autoPick : '—'}</b>
-                  <span className="tags">{shownNode ? <><em className={`p-${shownNode.protocol}`}>{shownNode.protocol}</em>{transportOf(shownNode) && <em>{transportOf(shownNode)}</em>}</> : <em>{nodes.length} {T.servers}</em>}</span>
-                </div>
-                {shownNode && pings[shownNode.id] !== undefined && <div className={`big-ping ${pingClass(pings[shownNode.id])}`}><Meter p={pings[shownNode.id]} /><span className="mono">{pings[shownNode.id] < 0 ? '×' : pings[shownNode.id]}</span></div>}
-              </div>
-              {quick.length > 0 && (
-                <div className="quick">
-                  {quick.map((n, qi) => { const f = splitFlag(n.name), p = pings[n.id]; return (
-                    <button key={n.id} className={`qchip rp ${n.id === activeId ? 'on' : ''}`} onClick={() => connectTo(n)} disabled={busyOff} title={f.label}>
-                      <span className={`medal m${qi + 1}`}>{qi + 1}</span><Flag cc={f.cc} size="s" />
-                      <span className="q-n" dir="auto">{f.label}</span>
-                      <b className={`mono ${pingClass(p)}`}>{p}<small>ms</small></b>
-                    </button>
-                  ); })}
-                </div>
-              )}
-              <div className="row3">
-                <button className="btn rp" onClick={() => setPage('servers')}>{I.servers}{T.change}</button>
-                <button className="btn sq rp" onClick={() => copyCfg(shownNode)} disabled={!shownNode} title={T.copyCfg} aria-label={T.copyCfg}>{I.copy}</button>
-                <button className="btn accent rp" onClick={connectFastest} disabled={busyOff || !nodes.length}>{I.bolt}{T.fastest}</button>
-              </div>
+        <Card className="srv-card">
+          <div className="lbl">{status === 'connected' ? T.current : T.location}</div>
+          <div className="srv-row">
+            <Flag cc={shownFlag?.cc || (auto ? 'AI' : '')} size="l" />
+            <div className="srv-txt">
+              <b dir="auto">{shownNode ? shownFlag?.label : auto ? T.autoPick : '—'}</b>
+              <span className="tags">{shownNode ? <><em className={`p-${shownNode.protocol}`}>{shownNode.protocol}</em>{transportOf(shownNode) && <em>{transportOf(shownNode)}</em>}</> : <em>{nodes.length} {T.servers}</em>}</span>
             </div>
-          </Card>
+            {shownNode && pings[shownNode.id] !== undefined && <div className={`big-ping ${pingClass(pings[shownNode.id])}`}><Meter p={pings[shownNode.id]} /><span className="mono">{pings[shownNode.id] < 0 ? '×' : pings[shownNode.id]}</span></div>}
+          </div>
+          {quick.length > 0 && (
+            <div className="quick">
+              {quick.map((n) => { const f = splitFlag(n.name), p = pings[n.id]; return (
+                <button key={n.id} className={`qchip rp ${n.id === activeId ? 'on' : ''}`} onClick={() => connectTo(n)} disabled={!!busy || status === 'connecting'} title={f.label}>
+                  <Flag cc={f.cc} size="s" />
+                  <span className="q-n" dir="auto">{f.label}</span>
+                  <b className={`mono ${pingClass(p)}`}>{p}<small>ms</small></b>
+                </button>
+              ); })}
+            </div>
+          )}
+          <div className="row3">
+            <button className="btn rp" onClick={() => setPage('servers')}>{I.servers}{T.change}</button>
+            <button className="btn sq rp" onClick={() => copyCfg(shownNode)} disabled={!shownNode} title={T.copyCfg} aria-label={T.copyCfg}>{I.copy}</button>
+            <button className="btn accent rp" onClick={connectFastest} disabled={!!busy || status === 'connecting' || !nodes.length}>{I.bolt}{T.fastest}</button>
+          </div>
+        </Card>
         )}
 
-        {status !== 'connected' && (
+        {status === 'connected' ? (
+        <>
+        <div className="tiles">
+          <Card className="tile dl">
+            <div className="tile-h"><span className="ti">{I.down}</span>{T.down}</div>
+            <div className="tile-v mono"><Count value={speed.down} fmt={(v) => fmtBytes(v)} /><small>/s</small></div>
+            <Area id="sd" n={30} h={36} series={[{ data: downs, color: '#22d3ee' }]} />
+          </Card>
+          <Card className="tile ul">
+            <div className="tile-h"><span className="ti">{I.up}</span>{T.up}</div>
+            <div className="tile-v mono"><Count value={speed.up} fmt={(v) => fmtBytes(v)} /><small>/s</small></div>
+            <Area id="su" n={30} h={36} series={[{ data: ups, color: '#ff4fd8' }]} />
+          </Card>
+        </div>
+        <Card className="info">
+          <button className="info-row rp" onClick={copyIp} disabled={!ip || typeof ip !== 'object'}>
+            <span className="ii">{I.globe}</span>
+            <span className="info-k">{T.ip}</span>
+            <span className="info-v mono">{ip === 'loading' ? <span className="skel" /> : ip && typeof ip === 'object' ? <><Flag cc={ip.countryCode} size="s" />{ip.query}<span className="cp">{I.copy}</span></> : '—'}</span>
+          </button>
+          <div className="info-row">
+            <span className="ii">{I.stats}</span>
+            <span className="info-k">{T.total}</span>
+            <span className="info-v mono"><Count value={speed.total} fmt={fmtBytes} /></span>
+          </div>
+          <div className="info-row">
+            <span className="ii">{I.lock}</span>
+            <span className="info-k">{T.mode}</span>
+            <span className="info-v mono">{mode.toUpperCase()}</span>
+          </div>
+        </Card>
+        </>
+        ) : (
+        <Card className="mode-card">
+          <div className="lbl">{T.modeTitle}</div>
           <div className="mode-pick">
             {(['tun', 'proxy'] as Mode[]).map((m) => (
-              <button key={m} className={`mp rp h3 tilt ${mode === m ? 'on' : ''}`} disabled={status !== 'idle'} onClick={() => setMode(m)}>
-                <Ico3 name={m === 'tun' ? 'cpu' : 'proxy'} />
+              <button key={m} className={`mp rp ${mode === m ? 'on' : ''}`} disabled={status !== 'idle'} onClick={() => setMode(m)}>
+                <span className="mp-ic">{m === 'tun' ? I.cpu : I.proxy}</span>
                 <span className="mp-tx"><b>{m === 'tun' ? 'TUN' : 'Proxy'}</b><small>{m === 'tun' ? T.tunHint : T.proxyHint}</small></span>
-                <span className="mp-ck">{I.check}</span>
               </button>
             ))}
           </div>
+        </Card>
         )}
-        {status === 'connected' && (
-          <Card className="mini-stats">
-            <div><small>{T.total}</small><b className="mono"><Count value={speed.total} fmt={fmtBytes} /></b></div>
-            <div><small>{T.peak}</small><b className="mono"><Count value={peak} fmt={fmtBytes} />/s</b></div>
-            <Area id="sd" n={40} h={44} series={[{ data: downs, color: '#5ee7ff' }, { data: ups, color: '#ff9be7' }]} />
-          </Card>
-        )}
-      </aside>
+      </div>
     </div>
+  );
+
+  const controlsLocked = status !== 'idle' || !!busy || connectionLock.current;
+  const modelTitle = model === 'aether'
+    ? (lang === 'fa' ? 'مدل ۲: WireGuard' : 'Model 2: WireGuard')
+    : (lang === 'fa' ? 'مدل ۱: سرورهای گیت‌هاب' : 'Model 1: GitHub servers');
+  const progressText = busy === 'fetch' ? T.fetching : busy === 'scan' ? T.scanning
+    : status === 'connecting' && model === 'aether'
+      ? (aetherStage === 'checking'
+        ? (lang === 'fa' ? 'در حال بررسی اتصال اینترنت…' : 'Checking internet access…')
+        : (lang === 'fa' ? 'در حال یافتن مسیر WireGuard…' : 'Finding a WireGuard route…'))
+      : status === 'connecting' ? stepText || T.connecting : label;
+  const Dashboard = (
+    <section className="simple-home" aria-labelledby="home-title">
+      <header className="simple-heading">
+        <span className="simple-eyebrow" dir="ltr">MAHYARVPN</span>
+        <h1 id="home-title">{lang === 'fa' ? 'یک کلیک تا اتصال' : 'One click to connect'}</h1>
+        <p>{lang === 'fa' ? 'مدل و حالت اتصال را انتخاب کنید. بقیه کارها با برنامه است.' : 'Choose a model and connection mode. We handle the setup.'}</p>
+      </header>
+      <div className="simple-status" role="status" aria-live="polite">
+        <span className={`simple-indicator ${status}`} />
+        <strong>{progressText}</strong>
+        {status === 'connected' && <span className="mono">{fmtTime(now - since)}</span>}
+      </div>
+      <button className={`simple-connect ${status}`} onClick={toggle}
+        disabled={status === 'connecting' || !!busy}
+        aria-label={status === 'connected' ? T.disconnect : T.connect}>
+        {status === 'connected' ? I.shieldOk : I.power}
+        <span>{status === 'connected' ? T.disconnect : status === 'connecting' || busy ? progressText : T.connect}</span>
+      </button>
+      <div className="simple-mode" role="group" aria-label={T.modeTitle}>
+        {(['proxy', 'tun'] as Mode[]).map((m) => (
+          <button key={m} aria-pressed={mode === m} disabled={controlsLocked}
+            className={mode === m ? 'selected' : ''} onClick={() => setMode(m)}>
+            {m === 'tun' ? I.cpu : I.proxy}
+            <span dir="ltr">{m === 'tun' ? 'Tunnel Mode' : 'Proxy Mode'}</span>
+          </button>
+        ))}
+      </div>
+      <p className="simple-hint">{mode === 'tun'
+        ? (lang === 'fa' ? 'ترافیک سیستم از تونل عبور می‌کند. ویندوز دسترسی Administrator می‌خواهد.' : 'System traffic uses the tunnel. Windows administrator permission is required.')
+        : (lang === 'fa' ? 'برای مرورگرها و برنامه‌هایی که پراکسی ویندوز را رعایت می‌کنند.' : 'For browsers and apps that respect the Windows system proxy.')}</p>
+      <button className="simple-model" disabled={controlsLocked} aria-expanded={modelPicker}
+        aria-controls="model-options" onClick={() => setModelPicker((v) => !v)}>
+        <span><small>{lang === 'fa' ? 'انتخاب مدل اتصال' : 'Connection model'}</small><strong>{modelTitle}</strong></span>
+        <span>{lang === 'fa' ? 'تغییر مدل' : 'Change model'} {I.chevron}</span>
+      </button>
+      {modelPicker && (
+        <div id="model-options" className="simple-model-options" role="group" aria-label={lang === 'fa' ? 'مدل اتصال' : 'Connection model'}>
+          {(['configs', 'aether'] as ConnectionModel[]).map((m, index) => (
+            <button key={m} disabled={controlsLocked} aria-pressed={model === m}
+              onClick={() => { setModel(m); setModelPicker(false); if (m === 'configs') setAuto(true); }}>
+              <b>{lang === 'fa' ? `مدل ${index + 1}` : `Model ${index + 1}`}</b>
+              <span>{m === 'configs'
+                ? (lang === 'fa' ? 'کانفیگ‌های گیت‌هاب، انتخاب سریع‌ترین سرور قابل‌اتصال' : 'GitHub configs, fastest working server')
+                : 'WireGuard · Balanced · IPv4'}</span>
+              {model === m && I.check}
+            </button>
+          ))}
+        </div>
+      )}
+      {model === 'configs' ? (
+        <div className="simple-server">
+          <label htmlFor="home-server">{lang === 'fa' ? 'انتخاب سرور' : 'Choose server'}</label>
+          <select id="home-server" disabled={controlsLocked} value={auto ? 'auto' : selected || 'auto'}
+            onChange={(e) => { const v = e.target.value; setAuto(v === 'auto'); if (v !== 'auto') setSelected(v); }}>
+            <option value="auto">{lang === 'fa' ? 'خودکار: بهترین سرور موجود' : 'Automatic: best available server'}</option>
+            {nodes.map((n) => <option key={n.id} value={n.id}>{splitFlag(n.name).label}{(pings[n.id] ?? -1) > 0 ? ` (${pings[n.id]} ms)` : ''}</option>)}
+          </select>
+          <p>{lang === 'fa' ? 'با زدن اتصال، کانفیگ‌های لازم دریافت و اتصال واقعی سرورها بررسی می‌شود.' : 'Connect fetches configs when needed and tests servers through their tunnels.'}</p>
+          {scan && <ScanPanel s={scan} T={T} compact />}
+          <details className="simple-advanced">
+            <summary>{lang === 'fa' ? 'ابزارهای پیشرفته و کانفیگ‌ها' : 'Advanced tools and configs'}</summary>
+            {AdvancedDashboard}
+          </details>
+        </div>
+      ) : (
+        <p className="simple-aether-note">{lang === 'fa'
+          ? 'WireGuard با اسکن Balanced روی IPv4. دریافت هویت، یافتن مسیر و تنظیم پراکسی یا تونل خودکار است؛ V2Ray لازم نیست.'
+          : 'WireGuard with Balanced discovery on IPv4. Identity, routing and proxy/TUN setup are automatic. No V2Ray needed.'}</p>
+      )}
+      {status === 'connected' && (
+        <div className="simple-session">
+          <span>{modelTitle}</span>
+          <span dir="auto">{model === 'configs' ? active && splitFlag(active.name).label : 'WireGuard · Balanced · IPv4'}</span>
+          <span className="mono">{ip && typeof ip === 'object' ? ip.query : ip === 'loading' ? '…' : ''}</span>
+        </div>
+      )}
+    </section>
   );
 
   const Servers = (
     <div className="pg servers">
       <div className="pg-head">
-        <Ico3 name="servers" size="xl" live />
-        <div className="pg-t">
+        <div>
           <h1>{T.servers}</h1>
-          <p className="pg-sub"><span className="chip-n">{nodes.length}</span>{tested > 0 && <span className="on-n"><i />{online} {T.online}</span>}<span className="muted">{T.lastUpdate}: {updatedText}</span></p>
+          <p className="pg-sub"><span className="chip-n">{nodes.length}</span>{tested > 0 && <span className="on-n"><i />{online} {T.online}</span>}<span className="muted">· {T.lastUpdate}: {updatedText}</span></p>
         </div>
         <div className="head-actions">
           <div className="tgroup">
-            <button className="tb" onClick={refetch} disabled={busyOff} data-tip={`${T.getConfigs} · F5`}><span className={busy === 'fetch' ? 'spin' : ''}>{I.refresh}</span></button>
-            <button className="tb" onClick={rescan} disabled={busyOff} data-tip={`${T.rescan} · Ctrl+R`}><span className={busy === 'scan' ? 'spin' : ''}>{I.radar}</span></button>
-            <button className="tb" onClick={testAll} disabled={busyOff || !nodes.length} data-tip={`${T.testPing} · Ctrl+T`}><span className={busy === 'test' ? 'pulse' : ''}>{I.pulse}</span></button>
+            <button className="tb" onClick={refetch} disabled={!!busy || status === 'connecting'} data-tip={`${T.getConfigs} · F5`}><span className={busy === 'fetch' ? 'spin' : ''}>{I.refresh}</span></button>
+            <button className="tb" onClick={rescan} disabled={!!busy || status === 'connecting'} data-tip={`${T.rescan} · Ctrl+R`}><span className={busy === 'scan' ? 'spin' : ''}>{I.radar}</span></button>
+            <button className="tb" onClick={testAll} disabled={!!busy || status === 'connecting' || !nodes.length} data-tip={`${T.testPing} · Ctrl+T`}><span className={busy === 'test' ? 'pulse' : ''}>{I.pulse}</span></button>
             <span className="tg-sep" />
             <button className={`tb ${sortPing ? 'on' : ''}`} onClick={() => setSortPing(!sortPing)} data-tip={T.sortPing}>{I.sort}</button>
           </div>
-          <button className="btn accent rp" onClick={connectFastest} disabled={busyOff || !nodes.length}>{I.bolt}<span className="hide-s">{T.fastest}</span></button>
+          <button className="btn accent rp" onClick={connectFastest} disabled={!!busy || status === 'connecting' || !nodes.length}>{I.bolt}<span className="hide-s">{T.fastest}</span></button>
         </div>
       </div>
       {scan ? (
@@ -888,9 +975,9 @@ export default function App() {
           <div className={`bar ${busy ? 'on' : ''}`}><i style={busy === 'test' && tested ? { width: `${(tested / Math.max(1, nodes.length)) * 100}%`, animation: 'none' } : undefined} /></div>
           {lastScan && picks.length > 0 && (
             <div className="scan-strip">
-              <Ico3 name="radar" size="s" />
+              <span className="ss-ic">{I.radar}</span>
               <span className="ss-t">{T.scanSum(lastScan.pool, lastScan.alive, lastScan.picked, Math.round(lastScan.ms / 1000))}</span>
-              <button className="btn sm ghost rp" onClick={rescan} disabled={busyOff}>{I.refresh}{T.rescan}</button>
+              <button className="btn sm ghost rp" onClick={rescan} disabled={!!busy || status === 'connecting'}>{I.refresh}{T.rescan}</button>
             </div>
           )}
         </>
@@ -899,7 +986,7 @@ export default function App() {
         <div className="search">
           {I.search}
           <input ref={searchRef} value={query} onChange={(e) => setQuery(e.target.value)} placeholder={T.search} />
-          {query ? <button className="clr" onClick={() => setQuery('')} aria-label="clear">{I.x}</button> : <Kbd k="Ctrl+F" />}
+          {query ? <button className="clr" onClick={() => setQuery('')}>{I.x}</button> : <Kbd k="Ctrl+F" />}
         </div>
         {nodes.length > 0 && (
           <div className="chips">
@@ -914,7 +1001,7 @@ export default function App() {
       <div className="grid">
         {!nodes.length && (
           <div className="empty">
-            <Ico3 name="servers" size="xl" live />
+            <div className="empty-art"><span /><span /><span />{I.servers}</div>
             <b>{T.noConfigs}</b><p>{T.emptyHint}</p>
             <button className="btn accent rp" onClick={refetch} disabled={!!busy}><span className={busy === 'fetch' ? 'spin' : ''}>{I.refresh}</span>{busy === 'fetch' ? T.fetching : T.getConfigs}</button>
           </div>
@@ -925,8 +1012,8 @@ export default function App() {
           const isSel = !auto && n.id === selected, isAct = n.id === activeId, isFav = favs.includes(n.id);
           const rk = rankOf.get(n.id);
           return (
-            <div key={n.id} role="button" tabIndex={0} className={`srv rp tilt ${isSel ? 'sel' : ''} ${isAct ? 'act' : ''}`}
-              style={{ animationDelay: `${Math.min(i, 18) * 30}ms` }} onClick={() => pick(n)} onDoubleClick={() => connectTo(n)} onKeyDown={(e) => e.key === 'Enter' && pick(n)}>
+            <div key={n.id} role="button" tabIndex={0} className={`srv rp ${isSel ? 'sel' : ''} ${isAct ? 'act' : ''}`}
+              style={{ animationDelay: `${Math.min(i, 18) * 26}ms` }} onClick={() => pick(n)} onDoubleClick={() => connectTo(n)} onKeyDown={(e) => e.key === 'Enter' && pick(n)}>
               <span className="flag-wrap"><Flag cc={f.cc} />{rk !== undefined && <span className={`rank ${rk < 3 ? `r${rk + 1}` : ''}`}>{rk + 1}</span>}</span>
               <div className="srv-meta">
                 <b dir="auto">{f.label}</b>
@@ -936,7 +1023,7 @@ export default function App() {
                 <Meter p={p} />
                 <span className="mono pill">{p === undefined ? (busy === 'test' ? '' : '—') : p < 0 ? T.timeout : `${p}ms`}</span>
               </div>
-              <span role="button" aria-label={T.favs} className={`fav ${isFav ? 'on' : ''}`} onClick={(e) => { e.stopPropagation(); toggleFav(n.id); }}>{I.star}</span>
+              <span role="button" className={`fav ${isFav ? 'on' : ''}`} onClick={(e) => { e.stopPropagation(); toggleFav(n.id); }}>{I.star}</span>
               {isAct && <span className="live">LIVE</span>}
             </div>
           );
@@ -947,26 +1034,26 @@ export default function App() {
 
   const Stats = (
     <div className="pg stats">
-      <div className="pg-head"><Ico3 name="stats" size="xl" live /><div className="pg-t"><h1>{T.stats}</h1><p className="pg-sub muted">{status === 'connected' ? `${T.session} · ${fmtTime(now - since)}` : T.notConnectedYet}</p></div></div>
+      <div className="pg-head"><div><h1>{T.stats}</h1><p className="pg-sub muted">{status === 'connected' ? `${T.session} · ${fmtTime(now - since)}` : T.notConnectedYet}</p></div></div>
       <div className="kpis">
-        {([
-          { k: T.uptime, v: status === 'connected' ? fmtTime(now - since) : '—', ic: 'clock' },
-          { k: T.total, v: <Count value={speed.total} fmt={fmtBytes} />, ic: 'stats' },
-          { k: T.peak, v: <><Count value={peak} fmt={fmtBytes} />/s</>, ic: 'bolt' },
-          { k: T.avg, v: <><Count value={avg} fmt={fmtBytes} />/s</>, ic: 'down' },
-        ] as const).map((x, i) => (
-          <Card key={i} className="kpi h3 tilt" style={{ animationDelay: `${i * 70}ms` }}>
-            <Ico3 name={x.ic} size="l" /><span className="kpi-k">{x.k}</span><span className="kpi-v mono">{x.v}</span>
+        {[
+          { k: T.uptime, v: status === 'connected' ? fmtTime(now - since) : '—', ic: I.clock },
+          { k: T.total, v: <Count value={speed.total} fmt={fmtBytes} />, ic: I.stats },
+          { k: T.peak, v: <><Count value={peak} fmt={fmtBytes} />/s</>, ic: I.bolt },
+          { k: T.avg, v: <><Count value={avg} fmt={fmtBytes} />/s</>, ic: I.down },
+        ].map((x, i) => (
+          <Card key={i} className="kpi" style={{ animationDelay: `${i * 60}ms` }}>
+            <span className="kpi-ic">{x.ic}</span><span className="kpi-k">{x.k}</span><span className="kpi-v mono">{x.v}</span>
           </Card>
         ))}
       </div>
       <Card className="chart">
         <div className="chart-h"><b>{T.liveTraffic}</b><span className="lg"><i className="d" />{T.down}<i className="u" />{T.up}</span></div>
-        <Area id="big" n={HIST} h={180} grid series={[{ data: downs, color: '#5ee7ff' }, { data: ups, color: '#ff9be7' }]} />
+        <Area id="big" n={HIST} h={180} grid series={[{ data: downs, color: '#22d3ee' }, { data: ups, color: '#ff4fd8' }]} />
       </Card>
       <div className="two">
         <Card className="hist">
-          <div className="chart-h"><b>{T.pingDist}</b><span className="muted mono">{tested}/{nodes.length}</span></div>
+          <div className="chart-h"><b>{T.pingDist}</b><span className="muted">{tested}/{nodes.length}</span></div>
           <div className="bars">
             {buckets.map((v, i) => {
               const m = Math.max(1, ...buckets);
@@ -989,7 +1076,6 @@ export default function App() {
               <span className="pc mono">{c}</span>
             </div>
           ))}
-          {!protoCount.length && <div className="empty small">{T.noConfigs}</div>}
         </Card>
       </div>
     </div>
@@ -997,14 +1083,14 @@ export default function App() {
 
   const Settings = (
     <div className="pg settings">
-      <div className="pg-head"><Ico3 name="settings" size="xl" live /><div className="pg-t"><h1>{T.settings}</h1><p className="pg-sub muted">MahyarVPN v{VERSION}</p></div></div>
+      <div className="pg-head"><div><h1>{T.settings}</h1><p className="pg-sub muted">MahyarVPN v{VERSION}</p></div></div>
       <div className="set-grid">
-        <Card className="set h3">
-          <div className="set-t"><Ico3 name="lock" size="s" />{T.connection}</div>
+        <Card className="set">
+          <div className="set-t">{I.lock}{T.connection}</div>
           <div className="mode-cards">
             {(['tun', 'proxy'] as Mode[]).map((m) => (
-              <button key={m} className={`mcard rp h3 tilt ${mode === m ? 'on' : ''}`} disabled={status !== 'idle'} onClick={() => setMode(m)}>
-                <Ico3 name={m === 'tun' ? 'cpu' : 'proxy'} size="l" />
+              <button key={m} className={`mcard rp ${mode === m ? 'on' : ''}`} disabled={status !== 'idle' || !!busy || connectionLock.current} onClick={() => setMode(m)}>
+                <span className="mc-ic">{m === 'tun' ? I.cpu : I.proxy}</span>
                 <b>{m === 'tun' ? 'TUN' : 'Proxy'}</b>
                 <small>{m === 'tun' ? T.tunHint : T.proxyHint}</small>
                 <span className="mc-check">{I.check}</span>
@@ -1015,10 +1101,9 @@ export default function App() {
           <div className="opt"><div><b>{T.sortPing}</b><small>{T.sortHint}</small></div><Switch on={sortPing} onChange={setSortPing} /></div>
           <div className="opt"><div><b>{T.startup}</b><small>{T.startupHint}</small></div><Switch on={startup} onChange={(v) => invoke('set_autostart', { on: v }).then(() => setStartup(v)).catch((e) => fail(errMsg(e)))} /></div>
           <div className="opt"><div><b>{T.autoConnect}</b><small>{T.autoConnectHint}</small></div><Switch on={autoConnect} onChange={setAutoConnect} /></div>
-          <div className="opt"><div><b>{T.bypassIr}</b><small>{T.bypassIrHint}</small></div><Switch on={bypassIr} onChange={changeBypass} disabled={status === 'connecting'} /></div>
         </Card>
-        <Card className="set h3">
-          <div className="set-t"><Ico3 name="palette" size="s" />{T.appearance}</div>
+        <Card className="set">
+          <div className="set-t">{I.palette}{T.appearance}</div>
           <div className="opt col"><b>{T.theme}</b>
             <div className="swatches">
               {(Object.keys(THEMES) as Theme[]).map((th) => (
@@ -1029,22 +1114,22 @@ export default function App() {
             </div>
           </div>
           <div className="opt"><div><b>{T.language}</b></div>
-            <div className="mini-seg" data-p={lang}>
-              <span className="ms-glow" />
+            <div className="mini-seg">
               <button className={lang === 'fa' ? 'on' : ''} onClick={() => setLang('fa')}>فارسی</button>
               <button className={lang === 'en' ? 'on' : ''} onClick={() => setLang('en')}>English</button>
+              <span className="ms-glow" data-p={lang === 'fa' ? 'tun' : 'proxy'} />
             </div>
           </div>
           <div className="opt"><div><b>{T.reduce}</b><small>{T.reduceHint}</small></div><Switch on={reduce} onChange={setReduce} /></div>
         </Card>
-        <Card className="set subs h3">
-          <div className="set-t"><Ico3 name="sub" size="s" />{T.subscription}<span className="set-badge mono">{nodes.length}</span></div>
+        <Card className="set subs">
+          <div className="set-t">{I.sub}{T.subscription}<span className="set-badge mono">{nodes.length}</span></div>
           <div className="src-list">
             {sources.map((x) => (
               <div key={x.id} className={`src-row ${subOff.includes(x.id) ? 'off' : ''}`}>
-                <Ico3 name={x.kind === 'own' ? 'lock' : 'radar'} size="s" />
+                <span className={`src-ic ${x.kind}`}>{x.kind === 'own' ? I.lock : I.radar}</span>
                 <div className="src-txt"><b dir="auto">{x.name}</b><small>{x.kind === 'own' ? T.srcOwnHint : T.srcPubHint(topN)}</small></div>
-                {!x.builtin && <button className="tb sm" onClick={() => { setCustomSubs((c) => c.filter((y) => y.id !== x.id)); setSubOff((o) => o.filter((y) => y !== x.id)); }} data-tip={T.remove} aria-label={T.remove}>{I.x}</button>}
+                {!x.builtin && <button className="tb sm" onClick={() => { setCustomSubs((c) => c.filter((y) => y.id !== x.id)); setSubOff((o) => o.filter((y) => y !== x.id)); }} data-tip={T.remove}>{I.x}</button>}
                 <Switch on={!subOff.includes(x.id)} onChange={(v) => setSubOff((o) => (v ? o.filter((y) => y !== x.id) : [...o, x.id]))} />
               </div>
             ))}
@@ -1066,13 +1151,13 @@ export default function App() {
               <button className="btn ghost rp" onClick={clearManual} disabled={!manual.length}>{I.x}{T.clearManual}</button>
             </div>
             <div className="row2">
-              <button className="btn rp" onClick={refetch} disabled={busyOff}><span className={busy === 'fetch' ? 'spin' : ''}>{I.refresh}</span>{busy === 'fetch' ? T.fetching : T.getConfigs}</button>
-              <button className="btn accent rp" onClick={rescan} disabled={busyOff}><span className={busy === 'scan' ? 'spin' : ''}>{I.radar}</span>{busy === 'scan' ? T.scanning : T.rescan}</button>
+              <button className="btn rp" onClick={refetch} disabled={!!busy || status === 'connecting'}><span className={busy === 'fetch' ? 'spin' : ''}>{I.refresh}</span>{busy === 'fetch' ? T.fetching : T.getConfigs}</button>
+              <button className="btn accent rp" onClick={rescan} disabled={!!busy || status === 'connecting'}><span className={busy === 'scan' ? 'spin' : ''}>{I.radar}</span>{busy === 'scan' ? T.scanning : T.rescan}</button>
             </div>
           </div>
         </Card>
-        <Card className="set h3">
-          <div className="set-t"><Ico3 name="keyboard" size="s" />{T.shortcuts}</div>
+        <Card className="set">
+          <div className="set-t">{I.keyboard}{T.shortcuts}</div>
           <div className="keys">
             {[[T.kPalette, 'Ctrl+K'], [T.kConnect, 'Ctrl+Enter'], [T.kConfigs, 'F5'], [T.kPing, 'Ctrl+T'], [T.kRescan, 'Ctrl+R'], [T.kImport, 'Ctrl+I'], [T.kSearch, 'Ctrl+F'], [T.kPages, 'Ctrl+1-4'], [T.kFull, 'F11']].map(([a, k]) => (
               <div key={k} className="krow"><span>{a}</span><Kbd k={k} /></div>
@@ -1080,8 +1165,8 @@ export default function App() {
           </div>
         </Card>
         <Card className="set about">
-          <Name3D size="m" status={status} />
-          <div className="about-tx"><span className="ver mono">v{VERSION}</span><small>{T.aboutText}</small></div>
+          <div className="about-logo">{I.logo}</div>
+          <div className="about-tx"><b>Mahyar<span className="grad">VPN</span> <span className="ver">v{VERSION}</span></b><small>{T.aboutText}</small></div>
           {hasUpd
             ? <button className="btn accent rp" onClick={openRelease}>{I.download}{T.download} v{upd}</button>
             : <button className="btn rp" onClick={() => checkUpdate()} disabled={upd === 'checking'}><span className={upd === 'checking' ? 'spin' : ''}>{upd === 'checking' ? I.refresh : I.rocket}</span>{upd === 'checking' ? T.checkingUpd : upd === 'latest' ? T.upToDate(VERSION) : T.checkUpd}</button>}
@@ -1090,48 +1175,45 @@ export default function App() {
     </div>
   );
 
-  const navItems: [Page, IcoName, string][] = [['home', 'home', T.home], ['servers', 'servers', T.servers], ['stats', 'stats', T.stats], ['settings', 'settings', T.settings]];
+  const navItems: [Page, ReactNode, string][] = [['home', I.home, T.home], ['servers', I.servers, T.servers], ['stats', I.stats, T.stats], ['settings', I.settings, T.settings]];
   const pIdx = PAGES.indexOf(page);
 
   return (
-    <div className="app" data-status={status} data-reduce={reduce} data-page={page} style={vars}>
-      <div className="bg">
-        <Warp status={status} a1={a1} a2={a2} st={ST[status]} traffic={speed.down + speed.up} reduce={reduce} anchor={page === 'home' ? '.orb-ball' : '.content'} />
-        <span className="nebula n1" /><span className="nebula n2" /><span className="vignette" />
-      </div>
+    <div className="app" data-status={status} data-reduce={reduce} style={vars}>
+      <div className="bg"><span className="aurora a" /><span className="aurora b" /><span className="aurora c" /><span className="noise" /><span className="grid-bg" /></div>
 
       <header className="titlebar" data-tauri-drag-region>
-        <div className="brand" data-tauri-drag-region><span className="brand-ic">{I.logo}</span><Name3D size="s" status={status} /></div>
+        <div className="brand" data-tauri-drag-region>{I.logo}<span>Mahyar<b className="grad">VPN</b></span></div>
         <button className="cmdk rp" onClick={() => setPal(true)}>{I.search}<span>{T.paletteHint}</span><Kbd k="Ctrl+K" /></button>
         <div className="win">
-          <button className="wb" onClick={() => setLang(lang === 'fa' ? 'en' : 'fa')} aria-label={T.language}><span className="wl">{lang === 'fa' ? 'EN' : 'فا'}</span></button>
+          <button className="wb" onClick={() => setLang(lang === 'fa' ? 'en' : 'fa')}><span className="wl">{lang === 'fa' ? 'EN' : 'فا'}</span></button>
           <button className="wb" onClick={() => invoke('hide_main').catch(() => win.minimize())} aria-label="minimize" title={T.toTray}>{I.min}</button>
           <button className="wb" onClick={() => win.toggleMaximize()} aria-label="maximize">{maxed ? I.restore : I.max}</button>
           <button className="wb x" onClick={() => invoke('hide_main').catch(() => win.close())} aria-label="close" title={T.toTray}>{I.close}</button>
         </div>
       </header>
 
-      <main className="content">
-        <div className="page" key={page}>{page === 'home' ? Dashboard : page === 'servers' ? Servers : page === 'stats' ? Stats : Settings}</div>
-      </main>
-
-      <nav className="dock-nav" style={{ ['--i' as any]: pIdx } as CSSProperties} aria-label="pages">
-        <span className="dn-ind" />
-        {navItems.map(([p, ic, l]) => (
-          <button key={p} className={`dn h3 ${page === p ? 'on' : ''}`} onClick={() => setPage(p)} aria-label={l} aria-current={page === p ? 'page' : undefined}>
-            <Ico3 name={ic} size="m" live={page === p} />
-            <span className="dn-l">{l}</span>
-            {p === 'servers' && nodes.length > 0 && <em>{nodes.length}</em>}
-          </button>
-        ))}
-        <span className="dn-sep" />
-        <span className={`dn-st ${status}`} title={label}><i /></span>
-      </nav>
+      <div className="shell">
+        <nav className="rail" style={{ ['--i' as any]: pIdx } as CSSProperties}>
+          <span className="rail-ind" />
+          {navItems.map(([p, ic, l]) => (
+            <button key={p} className={`rb ${page === p ? 'on' : ''}`} onClick={() => setPage(p)} data-tip={l}>
+              {ic}<span className="rl">{l}</span>
+              {p === 'servers' && nodes.length > 0 && <em>{nodes.length}</em>}
+            </button>
+          ))}
+          <span className="rail-sp" />
+          <span className={`rail-st`} title={label}><i /></span>
+        </nav>
+        <main className="content">
+          <div className="page" key={page}>{page === 'home' ? Dashboard : page === 'servers' ? Servers : page === 'stats' ? Stats : Settings}</div>
+        </main>
+      </div>
 
       <div className="toasts">
         {toasts.map((x) => (
           <div key={x.id} className={`toast ${x.type}`} onClick={() => setToasts((ts) => ts.filter((y) => y.id !== x.id))}>
-            <Ico3 name={x.type === 'ok' ? 'check' : 'alert'} size="s" live /><span className="t-msg">{x.msg}</span><span className="t-bar" />
+            <span className="t-ic">{x.type === 'ok' ? I.check : I.alert}</span><span className="t-msg">{x.msg}</span><span className="t-bar" />
           </div>
         ))}
       </div>
@@ -1167,7 +1249,7 @@ export default function App() {
       {importOpen && (
         <div className="overlay" onClick={() => setImportOpen(false)}>
           <div className="modal import" onClick={(e) => e.stopPropagation()}>
-            <Ico3 name="paste" size="xl" live />
+            <div className="m-ic">{I.paste}</div>
             <h3>{T.importTitle}</h3>
             <p>{T.importHint}</p>
             <textarea ref={importRef} value={importText} onChange={(e) => setImportText(e.target.value)} placeholder={T.importPh} dir="ltr" spellCheck={false}
@@ -1184,10 +1266,14 @@ export default function App() {
       {adminAsk && (
         <div className="overlay" onClick={() => setAdminAsk(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <Ico3 name="shieldOk" size="xl" live />
+            <div className="m-ic">{I.shieldOk}</div>
             <h3>{T.adminTitle}</h3>
             <p>{T.adminText}</p>
-            <button className="btn accent rp" onClick={() => invoke('relaunch_admin').catch((e) => { setAdminAsk(false); showToast(errMsg(e), 'err'); })}>{T.relaunch}</button>
+            <button className="btn accent rp" onClick={() => {
+              save('model', model); save('mode', mode); save('auto', auto); save('selected', selected);
+              save('resumeConnect', true);
+              invoke('relaunch_admin').catch((e) => { save('resumeConnect', false); setAdminAsk(false); showToast(errMsg(e), 'err'); });
+            }}>{T.relaunch}</button>
             <button className="btn rp" onClick={() => { setMode('proxy'); setAdminAsk(false); }}>{T.useProxy}</button>
             <button className="btn ghost" onClick={() => setAdminAsk(false)}>{T.cancel}</button>
           </div>
@@ -1196,9 +1282,11 @@ export default function App() {
 
       {splash && (
         <div className="splash">
-          <div className="sp-tunnel">{[0, 1, 2, 3, 4, 5].map((i) => <i key={i} style={{ ['--k' as any]: i } as CSSProperties} />)}</div>
-          <div className="sp-logo">{I.logo}</div>
-          <Name3D size="l" />
+          <div className="sp-logo">
+            <svg viewBox="0 0 32 32"><path className="sp-path" d="M16 2.5l11 4.2v8.1c0 7-4.9 11.9-11 14.2C9.9 26.7 5 21.8 5 14.8V6.7z" /><path className="sp-check" d="M11 15.5l3.6 3.6L21.5 12" /></svg>
+            <span className="sp-ring" />
+          </div>
+          <div className="sp-name">Mahyar<b className="grad">VPN</b></div>
           <div className="sp-bar"><i /></div>
         </div>
       )}

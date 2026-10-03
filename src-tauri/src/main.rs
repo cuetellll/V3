@@ -26,6 +26,8 @@ const API_PORT: u16 = 12335;
 #[derive(Default)]
 struct Core {
     child: Mutex<Option<Child>>,
+    aether: Mutex<Option<Child>>,
+    operation: Mutex<()>,
     proxy_on: Mutex<bool>,
 }
 
@@ -110,13 +112,139 @@ fn kill_core(core: &Core) {
         let _ = c.kill();
         let _ = c.wait();
     }
+    if let Some(mut c) = core.aether.lock().unwrap().take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+}
+
+fn aether_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("aether.exe"));
+            candidates.push(dir.join("bin/aether.exe"));
+        }
+    }
+    if let Ok(dir) = app.path().resource_dir() {
+        candidates.push(dir.join("aether.exe"));
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin/aether.exe"));
+    candidates.into_iter().find(|p| p.is_file())
+        .ok_or_else(|| "aether.exe is missing. Build with the included Windows workflow.".into())
+}
+
+/// A successful HTTP response through the mixed inbound, not just a live process.
+fn verify_connection(port: u16) -> Result<(), String> {
+    let proxy = ureq::Proxy::new(format!("http://127.0.0.1:{port}")).map_err(err)?;
+    let agent = ureq::AgentBuilder::new().proxy(proxy)
+        .timeout(Duration::from_secs(8)).build();
+    let mut failures = Vec::new();
+    for url in [
+        "https://www.gstatic.com/generate_204",
+        "https://cp.cloudflare.com/generate_204",
+    ] {
+        match agent.get(url).call() {
+            Ok(response) if response.status() == 204 => return Ok(()),
+            Ok(response) => failures.push(format!("HTTP {}", response.status())),
+            Err(e) => failures.push(e.to_string()),
+        }
+    }
+    Err(format!("Internet check through the tunnel failed: {}", failures.join("; ")))
+}
+
+fn launch_bridge(app: &AppHandle, core: &Core, config: String, system_proxy: bool, port: u16) -> Result<(), String> {
+    let dir = data_dir(app)?;
+    let cfg = dir.join("config.json");
+    let log = dir.join("core.log");
+    fs::write(&cfg, config).map_err(err)?;
+    let sb = singbox_path(app)?;
+    check_config(&sb, &cfg)?;
+    let child = spawn_core(&dir, &sb, &cfg, &log)?;
+    *core.child.lock().unwrap() = Some(child);
+    thread::sleep(Duration::from_millis(800));
+    if let Some(c) = core.child.lock().unwrap().as_mut() {
+        if c.try_wait().map_err(err)?.is_some() { return Err(tail(&log)); }
+    }
+    verify_connection(port)?;
+    if system_proxy { set_proxy(core, true, port)?; }
+    Ok(())
+}
+
+/// No V2Ray dependency: Aether -> local SOCKS5 -> sing-box -> Windows proxy/TUN.
+#[tauri::command]
+async fn start_aether(app: AppHandle, config: String, system_proxy: bool, port: u16) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let core = app.state::<Core>();
+        let _operation = core.operation.lock().unwrap();
+        kill_core(&core);
+        set_proxy(&core, false, PROXY_PORT)?;
+        let result = (|| {
+            let dir = data_dir(&app)?.join("aether");
+            fs::create_dir_all(&dir).map_err(err)?;
+            // Refuse to reuse an unrelated proxy that happens to own this port.
+            let reservation = std::net::TcpListener::bind("127.0.0.1:1819")
+                .map_err(|e| format!("Aether port 1819 is already in use: {e}"))?;
+            let log = dir.join("aether.log");
+            let file = fs::File::create(&log).map_err(err)?;
+            let mut cmd = Command::new(aether_path(&app)?);
+            // Fixed product profile, not ambient user shell settings (including Zero Trust).
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("AETHER_") { cmd.env_remove(key); }
+            }
+            cmd.current_dir(&dir)
+                .args(["--wg", "-4", "--scan", "balanced", "--noize", "balanced",
+                    "--bind", "127.0.0.1:1819", "--quick-reconnect"])
+                .env("AETHER_PROTOCOL", "wg")
+                .env("AETHER_SCAN", "balanced")
+                .env("AETHER_NOIZE", "balanced")
+                .env("AETHER_QUICK_RECONNECT", "1")
+                .env_remove("AETHER_PEER")
+                .env_remove("AETHER_WG_PEER")
+                .env_remove("AETHER_UPSTREAM")
+                .env_remove("AETHER_TEAM")
+                .env_remove("AETHER_WG_NO_DATA_CHECK")
+                .env("AETHER_CONFIG", dir.join("aether.toml"))
+                .env("AETHER_WG_CONFIG", dir.join("wireguard.toml"))
+                .stdin(Stdio::null())
+                .stderr(Stdio::from(file.try_clone().map_err(err)?))
+                .stdout(Stdio::from(file));
+            hide(&mut cmd);
+            drop(reservation);
+            *core.aether.lock().unwrap() = Some(cmd.spawn().map_err(err)?);
+            let _ = app.emit("aether-progress", "discovering");
+            let started = Instant::now();
+            loop {
+                {
+                    let mut child = core.aether.lock().unwrap();
+                    let c = child.as_mut().ok_or_else(|| "Aether stopped".to_string())?;
+                    if c.try_wait().map_err(err)?.is_some() { return Err(tail(&log)); }
+                }
+                if std::net::TcpStream::connect_timeout(
+                    &"127.0.0.1:1819".parse().map_err(err)?,
+                    Duration::from_millis(250),
+                ).is_ok() { break; }
+                if started.elapsed() > Duration::from_secs(240) {
+                    return Err(format!("Aether startup timed out: {}", tail(&log)));
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+            let _ = app.emit("aether-progress", "checking");
+            launch_bridge(&app, &core, config, system_proxy, port)
+        })();
+        if result.is_err() {
+            kill_core(&core);
+            let _ = set_proxy(&core, false, PROXY_PORT);
+        }
+        result
+    }).await.map_err(err)?
 }
 
 // ---------------- System proxy (Windows registry) ----------------
 #[cfg(windows)]
 mod sysproxy {
     use std::ffi::c_void;
-    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    use winreg::{enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE}, RegKey};
 
     #[link(name = "wininet")]
     extern "system" {
@@ -124,6 +252,36 @@ mod sysproxy {
     }
 
     const KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Backup {
+        enable: Option<u32>,
+        server: Option<String>,
+        bypass: Option<String>,
+        pac: Option<String>,
+    }
+
+    fn backup_path() -> Result<std::path::PathBuf, String> {
+        let dir = std::path::PathBuf::from(std::env::var_os("APPDATA")
+            .ok_or_else(|| "APPDATA is unavailable".to_string())?).join("com.mahyar.vpn");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        Ok(dir.join("system-proxy-backup.json"))
+    }
+
+    fn restore(key: &RegKey, backup: &Backup) -> Result<(), String> {
+        if let Some(v) = backup.enable { key.set_value("ProxyEnable", &v).map_err(|e| e.to_string())?; }
+        else { let _ = key.delete_value("ProxyEnable"); }
+        for (name, value) in [
+            ("ProxyServer", &backup.server),
+            ("ProxyOverride", &backup.bypass),
+            ("AutoConfigURL", &backup.pac),
+        ] {
+            if let Some(v) = value { key.set_value(name, v).map_err(|e| e.to_string())?; }
+            else { let _ = key.delete_value(name); }
+        }
+        refresh();
+        Ok(())
+    }
 
     fn refresh() {
         unsafe {
@@ -136,7 +294,19 @@ mod sysproxy {
         let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
             .create_subkey(KEY)
             .map_err(|e| e.to_string())?;
+        let path = backup_path()?;
         if enable {
+            if !path.exists() {
+                let backup = Backup {
+                    enable: key.get_value("ProxyEnable").ok(),
+                    server: key.get_value("ProxyServer").ok(),
+                    bypass: key.get_value("ProxyOverride").ok(),
+                    pac: key.get_value("AutoConfigURL").ok(),
+                };
+                let json = serde_json::to_vec(&backup).map_err(|e| e.to_string())?;
+                std::fs::write(&path, json).map_err(|e| e.to_string())?;
+            }
+            let _ = key.delete_value("AutoConfigURL");
             key.set_value("ProxyServer", &format!("127.0.0.1:{port}")).map_err(|e| e.to_string())?;
             key.set_value(
                 "ProxyOverride",
@@ -144,8 +314,16 @@ mod sysproxy {
             )
             .map_err(|e| e.to_string())?;
             key.set_value("ProxyEnable", &1u32).map_err(|e| e.to_string())?;
+        } else if path.exists() {
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let backup: Backup = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            restore(&key, &backup)?;
+            std::fs::remove_file(&path).map_err(|e| e.to_string())?;
         } else {
-            key.set_value("ProxyEnable", &0u32).map_err(|e| e.to_string())?;
+            let server: String = key.get_value("ProxyServer").unwrap_or_default();
+            if server == format!("127.0.0.1:{port}") {
+                key.set_value("ProxyEnable", &0u32).map_err(|e| e.to_string())?;
+            }
         }
         refresh();
         Ok(())
@@ -153,11 +331,13 @@ mod sysproxy {
 
     /// اگه دفعه قبل برنامه کرش کرده و پروکسی روشن مونده، خاموشش کن
     pub fn cleanup_stale(port: u16) {
-        if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY) {
+        if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(KEY, KEY_READ | KEY_WRITE) {
             let on: u32 = key.get_value("ProxyEnable").unwrap_or(0);
             let srv: String = key.get_value("ProxyServer").unwrap_or_default();
-            if on == 1 && srv == format!("127.0.0.1:{port}") {
+            if srv == format!("127.0.0.1:{port}") && (on == 1 || backup_path().map(|p| p.exists()).unwrap_or(false)) {
                 let _ = set(false, port);
+            } else if let Ok(path) = backup_path() {
+                let _ = std::fs::remove_file(path);
             }
         }
     }
@@ -171,9 +351,6 @@ mod sysproxy {
 
 fn set_proxy(core: &Core, enable: bool, port: u16) -> Result<(), String> {
     let mut on = core.proxy_on.lock().unwrap();
-    if !enable && !*on {
-        return Ok(());
-    }
     sysproxy::set(enable, port)?;
     *on = enable;
     Ok(())
@@ -193,27 +370,15 @@ fn urlencode(s: &str) -> String {
 async fn start_core(app: AppHandle, config: String, system_proxy: bool, port: u16) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let core = app.state::<Core>();
+        let _operation = core.operation.lock().unwrap();
         kill_core(&core);
-        let _ = set_proxy(&core, false, port);
-        let dir = data_dir(&app)?;
-        let cfg = dir.join("config.json");
-        let log = dir.join("core.log");
-        fs::write(&cfg, config).map_err(err)?;
-        let sb = singbox_path(&app)?;
-        check_config(&sb, &cfg)?;
-        let mut child = spawn_core(&dir, &sb, &cfg, &log)?;
-        thread::sleep(Duration::from_millis(1500));
-        if let Ok(Some(_)) = child.try_wait() {
-            return Err(tail(&log));
+        set_proxy(&core, false, PROXY_PORT)?;
+        let result = launch_bridge(&app, &core, config, system_proxy, port);
+        if result.is_err() {
+            kill_core(&core);
+            let _ = set_proxy(&core, false, PROXY_PORT);
         }
-        *core.child.lock().unwrap() = Some(child);
-        if system_proxy {
-            if let Err(e) = set_proxy(&core, true, port) {
-                kill_core(&core);
-                return Err(e);
-            }
-        }
-        Ok(())
+        result
     })
     .await
     .map_err(err)?
@@ -223,6 +388,7 @@ async fn start_core(app: AppHandle, config: String, system_proxy: bool, port: u1
 async fn stop_core(app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let core = app.state::<Core>();
+        let _operation = core.operation.lock().unwrap();
         kill_core(&core);
         set_proxy(&core, false, PROXY_PORT)
     })
@@ -232,11 +398,23 @@ async fn stop_core(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn core_running(core: State<'_, Core>) -> bool {
+    let _operation = core.operation.lock().unwrap();
     let mut g = core.child.lock().unwrap();
-    match g.as_mut() {
+    let bridge_running = match g.as_mut() {
         Some(c) => matches!(c.try_wait(), Ok(None)),
         None => false,
+    };
+    drop(g);
+    let engine_running = {
+        let mut a = core.aether.lock().unwrap();
+        a.as_mut().map(|c| matches!(c.try_wait(), Ok(None))).unwrap_or(true)
+    };
+    if !bridge_running || !engine_running {
+        kill_core(&core);
+        let _ = set_proxy(&core, false, PROXY_PORT);
+        return false;
     }
+    true
 }
 
 /// تست پینگ واقعی: یه sing-box موقت با همه سرورها بالا میاد و از طریق
@@ -688,6 +866,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             start_core,
+            start_aether,
             stop_core,
             core_running,
             test_delays,

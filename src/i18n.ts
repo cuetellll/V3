@@ -36,8 +36,6 @@ const fa = {
   addSubPh: 'لینک ساب جدید... https://', add: 'افزودن', remove: 'حذف', subAdded: 'ساب اضافه شد، «اسکن دوباره» یا «دریافت کانفیگ» رو بزن', subExists: 'این ساب از قبل هست',
   topN: 'تعداد کانفیگ از ساب عمومی', topNHint: 'بعد از تست، فقط این تعداد از سریع‌ترین‌ها نگه داشته میشن', kRescan: 'اسکن دوباره',
   // v2.4
-  bypassIr: 'سایت‌های ایرانی بدون VPN', bypassIrHint: 'بانک، شاپرک و سایت‌های .ir مستقیم باز میشن (Split Tunnel)',
-  irOn: 'سایت‌های ایرانی حالا مستقیم میرن', irOff: 'همه‌ی ترافیک از VPN میره', irLite: 'لیست کامل ایران دانلود نشد؛ فعلاً فقط دامنه‌های .ir مستقیم میرن',
   quickActions: 'کارهای سریع', getConfigsSub: 'لیست سرورها رو تازه کن', fresh: 'تازه', stale: 'قدیمی شده، بروز کن', aging: 'چند ساعت گذشته',
   importCfg: 'افزودن کانفیگ', importTitle: 'افزودن کانفیگ دستی', importHint: 'لینک vless / vmess / trojan / ss / hy2 یا لینک ساب base64 رو اینجا بچسبون. هر خط یه کانفیگ.',
   importPh: 'vless://...', pasteClip: 'چسباندن از کلیپ‌بورد', importBtn: 'افزودن به لیست', imported: (n: number) => `${n} کانفیگ اضافه شد`, importNone: 'کانفیگ معتبری توی متن نبود', clipFail: 'کلیپ‌بورد خونده نشد، خودت Ctrl+V بزن',
@@ -83,8 +81,6 @@ const en: Dict = {
   addSubPh: 'New subscription URL... https://', add: 'Add', remove: 'Remove', subAdded: 'Added. Hit Rescan or Get configs', subExists: 'Already added',
   topN: 'Configs kept from public subs', topNHint: 'After testing, only this many of the fastest are kept', kRescan: 'Rescan',
   // v2.4
-  bypassIr: 'Iranian sites without VPN', bypassIrHint: 'Banks, Shaparak and .ir sites open directly (split tunnel)',
-  irOn: 'Iranian sites now go direct', irOff: 'All traffic goes through the VPN', irLite: "Couldn't download the full Iran list; only .ir domains go direct for now",
   quickActions: 'Quick actions', getConfigsSub: 'Refresh the server list', fresh: 'Fresh', stale: 'Outdated, refresh it', aging: 'A few hours old',
   importCfg: 'Add config', importTitle: 'Add configs manually', importHint: 'Paste vless / vmess / trojan / ss / hy2 links or a base64 subscription. One config per line.',
   importPh: 'vless://...', pasteClip: 'Paste from clipboard', importBtn: 'Add to list', imported: (n) => `${n} configs added`, importNone: 'No valid config in the text', clipFail: "Couldn't read clipboard, press Ctrl+V",

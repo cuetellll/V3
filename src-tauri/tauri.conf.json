@@ -42,7 +42,10 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "bin/sing-box.exe": "sing-box.exe"
+      "bin/sing-box.exe": "sing-box.exe",
+      "bin/aether.exe": "aether.exe",
+      "bin/Aether-LICENSE.txt": "Aether-LICENSE.txt",
+      "bin/Aether-SOURCE.txt": "Aether-SOURCE.txt"
     },
     "windows": {
       "nsis": {
